@@ -1,0 +1,26 @@
+# Environment
+.env
+
+# Cache backups (keep analysis_cache.json, exclude backup files)
+cache/*.bak_*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Case study brief (not needed in repo)
+*.pdf
+
+# Original CSV copy in root (data/ has the correct one)
+Member Feedback Preventative Scan copy.csv
+
+# macOS
+.DS_Store
+
+# Virtual environments
+venv/
+.venv/
+env/
