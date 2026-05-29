@@ -1788,11 +1788,20 @@ def render_briefing_tab(
                 crits = digest.get("critical_responses", [])
                 if crits:
                     for c in crits:
+                        _crit_action = (c.get("suggested_action") or "").strip()
+                        _crit_body = f"<em>{c.get('feedback_text', '')}</em>"
+                        if _crit_action:
+                            _crit_body += (
+                                f'<div style="font-size:0.78rem;margin-top:7px;'
+                                f'padding-top:7px;border-top:1px solid rgba(0,0,0,0.08)">'
+                                f'<span style="font-weight:700">Suggested action:</span> '
+                                f'{_crit_action}</div>'
+                            )
                         st.markdown(
                             alert_box(
                                 "Critical",
                                 f"{c['response_id']} · {c['member_location']} · NPS {c.get('nps_score', '—')}",
-                                f"<em>{c.get('feedback_text', '')}</em>",
+                                _crit_body,
                                 meta=f"Category: {c.get('category', '—')} · "
                                 f"Severity: {c.get('severity_score')} · {c.get('trigger', '')}",
                             ),
