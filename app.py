@@ -384,12 +384,733 @@ def _delta_str(val: float | None, prefix: str = "") -> str:
 
 # ── Tab renderers ─────────────────────────────────────────────────────────────
 
+def _get_resolution_steps(
+    cat: str,
+    owner: str,
+    top_subcats: list[tuple[str, int]],   # [(subcategory, count), ...]
+    avg_sev: float,
+    n_total: int,
+    cache_key: str,
+    loc: str | None = None,
+) -> list[str]:
+    """
+    Return 3–5 specific, actionable resolution steps for the aggregate issue pattern.
+    Successful results are cached in session_state. Failures are NOT cached so the
+    next render will retry. Returns an empty list if no API key is available.
+    """
+    ss_key = f"_steps_{cache_key}"
+    cached = st.session_state.get(ss_key)
+    # Only use cache if it holds a non-empty result (don't cache failures)
+    if cached:
+        return cached
+
+    api_key = st.session_state.get("_api_key", "") or os.getenv("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return []
+
+    subcats_str = ", ".join(
+        f"{sub} ({cnt} response{'s' if cnt != 1 else ''})"
+        for sub, cnt in top_subcats[:5]
+    ) or "not specified"
+
+    loc_line = f"Location: {loc}\n" if loc else ""
+
+    prompt = f"""You are an operational advisor for PreventativeScan, a preventative health scanning company.
+
+A dashboard has flagged the following recurring issue pattern. Write exactly 3 to 5 numbered action steps to resolve it.
+
+Rules for each step:
+- Name the specific responsible team (use the Responsible Team provided)
+- State exactly what to do — no vague verbs like "escalate", "review", "monitor", or "follow up"
+- State what metric or outcome to measure to confirm improvement
+- Give a concrete timeframe (e.g. "within 48 hours", "by end of week", "weekly for 4 weeks")
+
+Format strictly — one step per line, nothing else:
+1. [Team]: [Specific action] — measure [metric] within [timeframe].
+
+Issue context:
+Category: {cat}
+{loc_line}Responsible team: {owner}
+Total flagged responses: {n_total}
+Average severity: {avg_sev}/5.0
+Top subcategories: {subcats_str}
+
+Write only the numbered steps. No preamble, no intro sentence, no summary."""
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+        with st.spinner("Generating action steps…"):
+            msg = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=512,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        raw = msg.content[0].text.strip()
+        # Accept any non-blank line that starts with a digit or "•/-"
+        steps = [
+            line.strip()
+            for line in raw.splitlines()
+            if line.strip() and (line.strip()[0].isdigit() or line.strip()[0] in "-•*")
+        ]
+        if steps:
+            st.session_state[ss_key] = steps
+        return steps
+    except Exception as e:
+        st.warning(f"Could not generate action steps: {e}")
+        return []
+
+
+def _get_location_health_steps(
+    loc: str,
+    status: str,
+    health_score: float,
+    avg_nps: float | None,
+    avg_sev: float,
+    detractor_rate: float,
+    flagged_issues: list[str],
+    top_categories: list[tuple[str, int]],
+    n_total: int,
+    cache_key: str,
+) -> list[str]:
+    """
+    Return 3–5 location-level action steps. API-synthesised when key is available;
+    template-based fallback otherwise. Successful results cached in session_state.
+    """
+    ss_key = f"_loc_health_{cache_key}"
+    cached = st.session_state.get(ss_key)
+    if cached:
+        return cached
+
+    api_key = st.session_state.get("_api_key", "") or os.getenv("ANTHROPIC_API_KEY", "")
+
+    if api_key:
+        flagged_str = ", ".join(flagged_issues) if flagged_issues else "none"
+        top_cats_str = (
+            ", ".join(f"{c} ({n} response{'s' if n != 1 else ''})" for c, n in top_categories[:5])
+            or "none"
+        )
+        nps_str = f"{avg_nps:.0f}" if avg_nps is not None else "N/A"
+        prompt = f"""You are an operational advisor for PreventativeScan, a preventative health scanning company.
+
+Given this location's performance summary, write exactly 3 to 5 numbered action steps.
+
+Rules for each step:
+- Name the responsible team
+- State exactly what to do — no vague verbs like "escalate", "review", "monitor", or "follow up"
+- State the metric or outcome to measure
+- Give a concrete timeframe
+- For healthy locations (status "Healthy"): focus on maintaining quality and sharing best practices
+- For at-risk locations: focus on specific remediation with urgency
+
+Format strictly — one step per line, nothing else:
+1. [Team]: [Specific action] — measure [metric] within [timeframe].
+
+Location context:
+Location: {loc}
+Status: {status} (health score {health_score:.0f}/100)
+NPS: {nps_str}
+Avg Severity: {avg_sev}/5.0
+Detractor Rate: {detractor_rate:.0%}
+Total Responses: {n_total}
+Flagged Issues: {flagged_str}
+Top Issue Categories: {top_cats_str}
+
+Write only the numbered steps. No preamble, no summary."""
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=api_key)
+            with st.spinner(f"Generating action steps for {loc}…"):
+                msg = client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=512,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+            raw = msg.content[0].text.strip()
+            steps = [
+                line.strip() for line in raw.splitlines()
+                if line.strip() and (line.strip()[0].isdigit() or line.strip()[0] in "-•*")
+            ]
+            if steps:
+                st.session_state[ss_key] = steps
+                return steps
+        except Exception as e:
+            st.warning(f"Could not generate action steps: {e}")
+
+    # ── Template fallback ─────────────────────────────────────────────────────
+    from config import CATEGORY_OWNER_MAP as _HLOC_MAP
+    steps: list[str] = []
+    i = 1
+    if flagged_issues:
+        for _fcat in flagged_issues[:2]:
+            _fowner = _HLOC_MAP.get(_fcat, "Operations")
+            steps.append(
+                f"{i}. {_fowner}: Conduct a root-cause analysis for elevated {_fcat} "
+                f"complaints at {loc} — identify the top 2 contributing factors and "
+                f"present a remediation plan within 2 weeks."
+            )
+            i += 1
+    if detractor_rate >= 0.35:
+        steps.append(
+            f"{i}. Member Experience: Directly contact the {int(detractor_rate * n_total)} "
+            f"Detractor respondents from {loc} — offer resolution and track re-contact "
+            f"completion rate weekly for 4 weeks."
+        )
+        i += 1
+    if avg_sev >= 3.5 and not flagged_issues:
+        if top_categories:
+            _towner = _HLOC_MAP.get(top_categories[0][0], "Operations")
+            steps.append(
+                f"{i}. {_towner}: Address the top issue category at {loc} "
+                f"({top_categories[0][0]}, {top_categories[0][1]} responses) — "
+                f"implement process change and track weekly severity average for 4 weeks."
+            )
+            i += 1
+    if status == "Healthy" and avg_nps is not None:
+        steps.append(
+            f"{i}. Member Experience: Document the {loc} member journey as a best-practice "
+            f"template (NPS {avg_nps:.0f}, avg severity {avg_sev}) — share with the 3 "
+            f"lowest-scoring locations within 30 days."
+        )
+        i += 1
+    if not steps:
+        steps.append(
+            f"1. Operations: Review {loc}'s current workflows against network benchmarks — "
+            f"identify one improvement opportunity and report findings within 2 weeks."
+        )
+    st.session_state[ss_key] = steps
+    return steps
+
+
+def _render_location_profile_detail(
+    loc: str,
+    df_full: pd.DataFrame,
+    health_row: pd.Series | None,
+    dev_df: pd.DataFrame,
+    page_key: str,
+) -> None:
+    """Full-width detail panel for a single location's health profile."""
+    from config import CATEGORY_OWNER_MAP as _LMAP, ALERT_EXCLUDE_CATEGORIES as _LEXCL
+
+    PAGE_SIZE = 5
+
+    # ── Data prep ─────────────────────────────────────────────────────────────
+    loc_df = df_full[df_full["member_location"] == loc].copy()
+
+    health_score = float(health_row["health_score"]) if health_row is not None else 50.0
+    avg_nps = health_row["avg_nps"] if health_row is not None else None
+    avg_sev = float(health_row["avg_severity"]) if health_row is not None else (
+        loc_df["severity_score"].mean() if not loc_df.empty else 0.0
+    )
+    det_rate = float(health_row["detractor_rate"]) if health_row is not None else 0.0
+    high_sev_rate = float(health_row["high_severity_rate"]) if health_row is not None else 0.0
+    n_total = int(health_row["total_responses"]) if health_row is not None else len(loc_df)
+
+    if health_score < 45:
+        status = "At Risk"
+        status_color = CRITICAL_BORDER
+    elif health_score < 60:
+        status = "Monitor"
+        status_color = WARNING_BORDER
+    else:
+        status = "Healthy"
+        status_color = "#22C55E"
+
+    # Flagged issues for this location
+    loc_flagged = (
+        dev_df[(dev_df["member_location"] == loc) & (dev_df["is_flagged"])]
+        .sort_values("deviation_score", ascending=False)
+        if not dev_df.empty and "is_flagged" in dev_df.columns
+        else pd.DataFrame()
+    )
+
+    # Top issue categories for this location (operational only)
+    top_cats: list[tuple[str, int]] = []
+    if "issue_category" in loc_df.columns:
+        top_cats = list(
+            loc_df[~loc_df["issue_category"].isin(_LEXCL)]
+            .groupby("issue_category")["response_id"]
+            .count()
+            .sort_values(ascending=False)
+            .head(5)
+            .items()
+        )
+
+    # ── Health summary box ────────────────────────────────────────────────────
+    nps_display = f"{avg_nps:.0f}" if avg_nps is not None else "—"
+    summary_text = (
+        f"{loc} is <strong>{status}</strong> with a health score of "
+        f"<strong>{health_score:.0f}/100</strong>. "
+        f"NPS: {nps_display} · Avg severity: {avg_sev:.1f}/5.0 · "
+        f"Detractor rate: {det_rate:.0%} · High-severity rate: {high_sev_rate:.0%} · "
+        f"{n_total} total responses."
+    )
+    st.markdown(
+        f'<div style="background:{CREAM};border-left:4px solid {status_color};'
+        f"border-radius:0 6px 6px 0;padding:12px 16px;margin-bottom:16px;line-height:1.6\">"
+        f'<div style="font-size:0.75rem;font-weight:700;letter-spacing:0.05em;'
+        f'color:{status_color};text-transform:uppercase;margin-bottom:6px">Location Health</div>'
+        f'<div style="font-size:0.85rem;color:{DARK}">{summary_text}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Two-column: flagged issues + top categories ───────────────────────────
+    _c1, _c2 = st.columns(2)
+    with _c1:
+        if not loc_flagged.empty:
+            st.markdown("**⚠ Flagged Issues**")
+            for _, _fr in loc_flagged.iterrows():
+                _dpct = int(_fr["deviation_score"] * 100)
+                st.markdown(
+                    f'<div style="font-size:0.82rem;padding:4px 0;'
+                    f'border-bottom:1px solid {MEDIUM_GRAY}33">'
+                    f'<span style="color:{CRITICAL_BORDER};font-weight:600">+{_dpct}%</span> '
+                    f'{_fr["issue_category"]} · {int(_fr["loc_count"])} responses</div>',
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.markdown("**✅ No Flagged Issues**")
+            st.caption("No issue categories are significantly above the network average.")
+
+    with _c2:
+        if top_cats:
+            st.markdown("**Top Issue Categories**")
+            _max_cnt = top_cats[0][1] if top_cats else 1
+            for _cat, _cnt in top_cats:
+                _bar_pct = int(_cnt / _max_cnt * 100)
+                st.markdown(
+                    f'<div style="font-size:0.82rem;padding:4px 0;'
+                    f'border-bottom:1px solid {MEDIUM_GRAY}33">'
+                    f'<div style="display:flex;justify-content:space-between">'
+                    f'<span>{_cat}</span>'
+                    f'<span style="color:{MEDIUM_GRAY}">{_cnt}</span></div>'
+                    f'<div style="height:4px;background:{MEDIUM_GRAY}22;border-radius:2px;margin-top:3px">'
+                    f'<div style="height:4px;width:{_bar_pct}%;background:{status_color};border-radius:2px"></div>'
+                    f'</div></div>',
+                    unsafe_allow_html=True,
+                )
+
+    st.markdown("")
+
+    # ── Action Steps ─────────────────────────────────────────────────────────
+    _lh_steps = _get_location_health_steps(
+        loc=loc, status=status, health_score=health_score,
+        avg_nps=float(avg_nps) if avg_nps is not None else None,
+        avg_sev=avg_sev, detractor_rate=det_rate,
+        flagged_issues=[r["issue_category"] for _, r in loc_flagged.iterrows()],
+        top_categories=top_cats, n_total=n_total,
+        cache_key="_".join(loc.split()),
+    )
+    if _lh_steps:
+        st.markdown("**Suggested Action Steps**")
+        for _i, _step in enumerate(_lh_steps, 1):
+            st.markdown(_step if _step[0].isdigit() else f"{_i}. {_step}")
+        st.markdown("")
+
+    # ── Recent High-Severity Feedback (severity 4–5, paginated) ─────────────
+    if "severity_score" in loc_df.columns:
+        _sev_df = (
+            loc_df[loc_df["severity_score"] >= 4]
+            .sort_values(["severity_score", "response_date"], ascending=[False, False])
+            .reset_index(drop=True)
+        )
+        if "has_feedback" in _sev_df.columns:
+            _sev_df = _sev_df[_sev_df["has_feedback"]].reset_index(drop=True)
+        elif "feedback_text" in _sev_df.columns:
+            _sev_df = _sev_df[_sev_df["feedback_text"].str.strip().ne("")].reset_index(drop=True)
+    else:
+        _sev_df = pd.DataFrame()
+
+    _sev_total = len(_sev_df)
+    st.markdown(
+        f"**High-Severity Feedback** (severity 4–5) · "
+        f"{_sev_total} response{'s' if _sev_total != 1 else ''}"
+    )
+
+    if _sev_total == 0:
+        st.caption("No severity 4–5 responses for this location.")
+    else:
+        if page_key not in st.session_state:
+            st.session_state[page_key] = 0
+        _sev_pages = max(1, (_sev_total + PAGE_SIZE - 1) // PAGE_SIZE)
+        _sev_page = min(st.session_state[page_key], _sev_pages - 1)
+        st.session_state[page_key] = _sev_page
+        _sev_start = _sev_page * PAGE_SIZE
+        _sev_end = min(_sev_start + PAGE_SIZE, _sev_total)
+        _sev_rows = list(_sev_df.iloc[_sev_start:_sev_end].iterrows())
+
+        _html_parts = []
+        for _si, (_, _sr) in enumerate(_sev_rows):
+            _date_s = str(_sr.get("response_date", ""))[:10]
+            _fb = str(_sr.get("feedback_text", "")).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            _sep = f"border-bottom:1px solid {MEDIUM_GRAY}44;" if _si < len(_sev_rows) - 1 else ""
+            _sc = CRITICAL_BORDER if int(_sr["severity_score"]) == 5 else WARNING_BORDER
+            _html_parts.append(
+                f'<div style="padding:7px 0;{_sep}">'
+                f'<div style="font-size:0.76rem;font-weight:600;color:{DARK};margin-bottom:2px">'
+                f'{_sr["response_id"]} · NPS {_sr.get("nps_score", "—")} · '
+                f'<span style="color:{_sc}">Severity {int(_sr["severity_score"])}</span> · '
+                f'{_sr.get("issue_category", "—")} · {_date_s}</div>'
+                f'<div style="font-size:0.82rem;color:#4B5563;line-height:1.45">{_fb}</div>'
+                f'</div>'
+            )
+        st.markdown("".join(_html_parts), unsafe_allow_html=True)
+
+        if _sev_pages > 1:
+            _pp1, _pp2, _pp3 = st.columns([1, 2, 1])
+            with _pp1:
+                if _sev_page > 0:
+                    if st.button("← Prev", key=f"prev_{page_key}"):
+                        st.session_state[page_key] -= 1
+                        st.rerun()
+            with _pp2:
+                st.caption(f"Page {_sev_page + 1} of {_sev_pages} · {_sev_total} total")
+            with _pp3:
+                if _sev_page < _sev_pages - 1:
+                    if st.button("Next →", key=f"next_{page_key}"):
+                        st.session_state[page_key] += 1
+                        st.rerun()
+
+
+def _render_loc_issue_detail(
+    loc: str,
+    cat: str,
+    dev_row: pd.Series,
+    df_full: pd.DataFrame,
+    page_key: str,
+    persist_weeks: int | None = None,
+) -> None:
+    """Render expanded content for a single location issue card.
+    df_full must be the complete enriched dataset (not date-filtered) so all
+    responses for this location + category are available.
+    """
+    PAGE_SIZE = 5
+
+    loc_df = df_full[
+        (df_full["member_location"] == loc) & (df_full["issue_category"] == cat)
+    ].sort_values("severity_score", ascending=False).reset_index(drop=True)
+
+    # ── Compute values ────────────────────────────────────────────────────────
+    n_total = len(loc_df)
+    avg_sev = round(loc_df["severity_score"].mean(), 1) if n_total > 0 else 0.0
+
+    # Top 2 unique root causes from highest-severity responses
+    root_causes: list[str] = []
+    if "root_cause_hypothesis" in loc_df.columns:
+        root_causes = (
+            loc_df["root_cause_hypothesis"]
+            .dropna()
+            .loc[lambda s: s.str.strip() != ""]
+            .drop_duplicates()
+            .head(2)
+            .tolist()
+        )
+
+    # ── Highlighted summary block ─────────────────────────────────────────────
+    if persist_weeks is not None:
+        summary_text = (
+            f"{loc} has had {cat} ranking as a persistent top-3 issue for "
+            f"{persist_weeks} consecutive weeks — {n_total} responses, "
+            f"average severity {avg_sev}/5.0. This pattern indicates a systemic "
+            "operational problem, not random variation."
+        )
+    else:
+        dev_pct = int(dev_row["deviation_score"] * 100)
+        summary_text = (
+            f"{loc} is running +{dev_pct}% above the network average for {cat} issues "
+            f"across {n_total} responses — {dev_row['loc_rate']:.1%} issue rate vs. "
+            f"{dev_row['network_rate']:.1%} network average, average severity {avg_sev}/5.0."
+        )
+    if root_causes:
+        summary_text += " " + " ".join(root_causes)
+
+    st.markdown(
+        f'<div style="background:{CREAM};border-left:4px solid {WARNING_BORDER};'
+        f"border-radius:0 6px 6px 0;padding:12px 16px;margin-bottom:16px;"
+        f'line-height:1.6">'
+        f'<div style="font-size:0.75rem;font-weight:700;letter-spacing:0.05em;'
+        f'color:{WARNING_BORDER};text-transform:uppercase;margin-bottom:6px">'
+        f"Issue Summary</div>"
+        f'<div style="font-size:0.85rem;color:{DARK}">{summary_text}</div>'
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+
+    # ── Resolution Steps ─────────────────────────────────────────────────────
+    # Build top-subcategory list (used by both API path and fallback)
+    from config import CATEGORY_OWNER_MAP as _OWNER_MAP
+    _owner = _OWNER_MAP.get(cat, "Member Experience")
+    _top_subcats: list[tuple[str, int]] = []
+    if "issue_subcategory" in loc_df.columns:
+        _sub_counts = (
+            loc_df.groupby("issue_subcategory")["response_id"]
+            .count()
+            .sort_values(ascending=False)
+            .head(5)
+        )
+        _top_subcats = list(_sub_counts.items())
+
+    _steps_cache_key = f"loc_{'_'.join(loc.split())}_{cat.split('/')[0].strip().replace(' ', '_')}"
+    _steps = _get_resolution_steps(
+        cat=cat, owner=_owner, top_subcats=_top_subcats,
+        avg_sev=avg_sev, n_total=n_total,
+        cache_key=_steps_cache_key, loc=loc,
+    )
+
+    # Fallback: scrape best suggested_operational_action per top subcategory
+    if not _steps and "suggested_operational_action" in loc_df.columns and _top_subcats:
+        _seen: set[str] = set()
+        for _sub, _ in _top_subcats:
+            _candidates = (
+                loc_df[loc_df["issue_subcategory"] == _sub]
+                .sort_values("severity_score", ascending=False)["suggested_operational_action"]
+                .dropna().loc[lambda s: s.str.strip() != ""].tolist()
+            )
+            for _c in _candidates:
+                _c_clean = _c.strip()
+                if _c_clean not in _seen:
+                    _steps.append(_c_clean)
+                    _seen.add(_c_clean)
+                    break
+            if len(_steps) >= 5:
+                break
+
+    if _steps:
+        st.markdown("**Suggested Resolution Steps**")
+        for _i, _step in enumerate(_steps, 1):
+            # Fallback steps may not have a leading number; add one if missing
+            st.markdown(_step if _step[0].isdigit() else f"{_i}. {_step}")
+        st.markdown("")
+
+    # ── Paginated Feedback ────────────────────────────────────────────────────
+    if "has_feedback" in loc_df.columns:
+        _fb_df = loc_df[loc_df["has_feedback"]].reset_index(drop=True)
+    elif "feedback_text" in loc_df.columns:
+        _fb_df = loc_df[loc_df["feedback_text"].str.strip().ne("")].reset_index(drop=True)
+    else:
+        _fb_df = pd.DataFrame()
+
+    total = len(_fb_df)
+    st.markdown(
+        f"**Associated Feedback** · {total} response{'s' if total != 1 else ''} with comments"
+    )
+
+    if total == 0:
+        st.caption("No written feedback available for this location and category.")
+        return
+
+    if page_key not in st.session_state:
+        st.session_state[page_key] = 0
+
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = min(st.session_state[page_key], total_pages - 1)
+    st.session_state[page_key] = page
+
+    start = page * PAGE_SIZE
+    end = min(start + PAGE_SIZE, total)
+    page_rows = list(_fb_df.iloc[start:end].iterrows())
+
+    # Render all page responses as one HTML block — eliminates inter-widget margins
+    _fb_html = []
+    for i, (_, row) in enumerate(page_rows):
+        date_str = str(row.get("response_date", ""))[:10]
+        fb_text = str(row.get("feedback_text", "")).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        sep_style = f"border-bottom:1px solid {MEDIUM_GRAY}44;" if i < len(page_rows) - 1 else ""
+        _fb_html.append(
+            f'<div style="padding:7px 0;{sep_style}">'
+            f'<div style="font-size:0.76rem;font-weight:600;color:{DARK};margin-bottom:2px">'
+            f"{row['response_id']} · NPS {row.get('nps_score', '—')} · "
+            f"Severity {row['severity_score']} · {date_str}</div>"
+            f'<div style="font-size:0.82rem;color:#4B5563;line-height:1.45">{fb_text}</div>'
+            f"</div>"
+        )
+    st.markdown("".join(_fb_html), unsafe_allow_html=True)
+
+    if total_pages > 1:
+        _p1, _p2, _p3 = st.columns([1, 2, 1])
+        with _p1:
+            if page > 0:
+                if st.button("← Prev", key=f"prev_{page_key}"):
+                    st.session_state[page_key] -= 1
+                    st.rerun()
+        with _p2:
+            st.caption(f"Page {page + 1} of {total_pages} · {total} total")
+        with _p3:
+            if page < total_pages - 1:
+                if st.button("Next →", key=f"next_{page_key}"):
+                    st.session_state[page_key] += 1
+                    st.rerun()
+
+
+def _render_cat_issue_detail(
+    cat: str,
+    rank: int,
+    df_full: pd.DataFrame,
+    page_key: str,
+) -> None:
+    """Render expanded content for a top issue category card.
+    df_full must be the complete enriched dataset so all responses for this
+    category are included regardless of date filter.
+    """
+    PAGE_SIZE = 5
+
+    cat_df = (
+        df_full[df_full["issue_category"] == cat]
+        .sort_values("severity_score", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    n_total = len(cat_df)
+    avg_sev = round(cat_df["severity_score"].mean(), 1) if n_total > 0 else 0.0
+    det_count = int((cat_df["nps_segment"] == "Detractor").sum()) if "nps_segment" in cat_df.columns else 0
+    det_pct = round(det_count / n_total * 100, 1) if n_total > 0 else 0.0
+    churn_count = int(cat_df["churn_risk"].sum()) if "churn_risk" in cat_df.columns else 0
+
+    # Top 2 unique root causes from highest-severity responses
+    root_causes: list[str] = []
+    if "root_cause_hypothesis" in cat_df.columns:
+        root_causes = (
+            cat_df["root_cause_hypothesis"]
+            .dropna()
+            .loc[lambda s: s.str.strip() != ""]
+            .drop_duplicates()
+            .head(2)
+            .tolist()
+        )
+
+    # ── Highlighted summary block ─────────────────────────────────────────────
+    summary_text = (
+        f"{cat} is the #{rank} most reported issue category with {n_total} total responses — "
+        f"average severity {avg_sev}/5.0, {det_pct:.0f}% detractor rate"
+        + (f", {churn_count} churn-risk response{'s' if churn_count != 1 else ''}" if churn_count > 0 else "")
+        + "."
+    )
+    if root_causes:
+        summary_text += " " + " ".join(root_causes)
+
+    st.markdown(
+        f'<div style="background:{CREAM};border-left:4px solid {WARNING_BORDER};'
+        f"border-radius:0 6px 6px 0;padding:12px 16px;margin-bottom:16px;"
+        f'line-height:1.6">'
+        f'<div style="font-size:0.75rem;font-weight:700;letter-spacing:0.05em;'
+        f'color:{WARNING_BORDER};text-transform:uppercase;margin-bottom:6px">'
+        f"Issue Summary</div>"
+        f'<div style="font-size:0.85rem;color:{DARK}">{summary_text}</div>'
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Resolution Steps ─────────────────────────────────────────────────────
+    from config import CATEGORY_OWNER_MAP as _CAT_OWNER_MAP
+    _cat_owner = _CAT_OWNER_MAP.get(cat, "Member Experience")
+    _cat_top_subcats: list[tuple[str, int]] = []
+    if "issue_subcategory" in cat_df.columns:
+        _cat_sub_counts = (
+            cat_df.groupby("issue_subcategory")["response_id"]
+            .count()
+            .sort_values(ascending=False)
+            .head(5)
+        )
+        _cat_top_subcats = list(_cat_sub_counts.items())
+
+    _cat_steps_cache_key = f"cat_{cat.split('/')[0].strip().replace(' ', '_')}"
+    _cat_steps = _get_resolution_steps(
+        cat=cat, owner=_cat_owner, top_subcats=_cat_top_subcats,
+        avg_sev=avg_sev, n_total=n_total, cache_key=_cat_steps_cache_key,
+    )
+
+    # Fallback: scrape best suggested_operational_action per top subcategory
+    if not _cat_steps and "suggested_operational_action" in cat_df.columns and _cat_top_subcats:
+        _cat_seen: set[str] = set()
+        for _sub, _ in _cat_top_subcats:
+            _candidates = (
+                cat_df[cat_df["issue_subcategory"] == _sub]
+                .sort_values("severity_score", ascending=False)["suggested_operational_action"]
+                .dropna().loc[lambda s: s.str.strip() != ""].tolist()
+            )
+            for _c in _candidates:
+                _c_clean = _c.strip()
+                if _c_clean not in _cat_seen:
+                    _cat_steps.append(_c_clean)
+                    _cat_seen.add(_c_clean)
+                    break
+            if len(_cat_steps) >= 5:
+                break
+
+    if _cat_steps:
+        st.markdown("**Suggested Resolution Steps**")
+        for _i, _step in enumerate(_cat_steps, 1):
+            st.markdown(_step if _step[0].isdigit() else f"{_i}. {_step}")
+        st.markdown("")
+
+    # ── Paginated Feedback ────────────────────────────────────────────────────
+    if "has_feedback" in cat_df.columns:
+        _fb_df = cat_df[cat_df["has_feedback"]].reset_index(drop=True)
+    elif "feedback_text" in cat_df.columns:
+        _fb_df = cat_df[cat_df["feedback_text"].str.strip().ne("")].reset_index(drop=True)
+    else:
+        _fb_df = pd.DataFrame()
+
+    total = len(_fb_df)
+    st.markdown(
+        f"**Associated Feedback** · {total} response{'s' if total != 1 else ''} with comments"
+    )
+
+    if total == 0:
+        st.caption("No written feedback available for this category.")
+        return
+
+    if page_key not in st.session_state:
+        st.session_state[page_key] = 0
+
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = min(st.session_state[page_key], total_pages - 1)
+    st.session_state[page_key] = page
+
+    start = page * PAGE_SIZE
+    end = min(start + PAGE_SIZE, total)
+    page_rows = list(_fb_df.iloc[start:end].iterrows())
+
+    # Render all page responses as one HTML block — eliminates inter-widget margins
+    _fb_html = []
+    for i, (_, row) in enumerate(page_rows):
+        date_str = str(row.get("response_date", ""))[:10]
+        fb_text = str(row.get("feedback_text", "")).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        sep_style = f"border-bottom:1px solid {MEDIUM_GRAY}44;" if i < len(page_rows) - 1 else ""
+        _fb_html.append(
+            f'<div style="padding:7px 0;{sep_style}">'
+            f'<div style="font-size:0.76rem;font-weight:600;color:{DARK};margin-bottom:2px">'
+            f"{row['response_id']} · {row.get('member_location', '—')} · "
+            f"NPS {row.get('nps_score', '—')} · Severity {row['severity_score']} · {date_str}</div>"
+            f'<div style="font-size:0.82rem;color:#4B5563;line-height:1.45">{fb_text}</div>'
+            f"</div>"
+        )
+    st.markdown("".join(_fb_html), unsafe_allow_html=True)
+
+    if total_pages > 1:
+        _p1, _p2, _p3 = st.columns([1, 2, 1])
+        with _p1:
+            if page > 0:
+                if st.button("← Prev", key=f"prev_{page_key}"):
+                    st.session_state[page_key] -= 1
+                    st.rerun()
+        with _p2:
+            st.caption(f"Page {page + 1} of {total_pages} · {total} total")
+        with _p3:
+            if page < total_pages - 1:
+                if st.button("Next →", key=f"next_{page_key}"):
+                    st.session_state[page_key] += 1
+                    st.rerun()
+
+
 def render_briefing_tab(
     df: pd.DataFrame,
     all_alerts: list[dict],
     dev_df: pd.DataFrame,
     persist_df: pd.DataFrame,
     df_full: pd.DataFrame,
+    health_df: pd.DataFrame,
 ) -> None:
     """Combined Briefing + Overview tab.
     df       = sidebar-filtered data (KPI strip, daily drill-down, NPS dist, location sections)
@@ -399,7 +1120,12 @@ def render_briefing_tab(
         st.info("No responses match the current filters.")
         return
 
-    from config import ALERT_EXCLUDE_CATEGORIES as _EXCL, OPERATIONAL_CATEGORIES as _OP_CATS, SUBCATEGORY_MAP as _SUBCAT_MAP
+    from config import (
+        ALERT_EXCLUDE_CATEGORIES as _EXCL,
+        OPERATIONAL_CATEGORIES as _OP_CATS,
+        SUBCATEGORY_MAP as _SUBCAT_MAP,
+        CATEGORY_OWNER_MAP as _COWNER_MAP,
+    )
 
     # ── 1. KPI STRIP ─────────────────────────────────────────────────────────
     nps = compute_nps(df)
@@ -486,79 +1212,429 @@ def render_briefing_tab(
                     float(nps["detractor_pct"]) - float(_prior_nps_obj["detractor_pct"]), 1
                 )
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    nps_val = nps["nps"]
-    # NPS: higher is better → default delta_color (green for positive) is correct
-    c1.metric(
-        "NPS Score",
-        f"{nps_val:.0f}" if nps_val is not None else "—",
-        delta=(
-            f"{_prior_nps_delta:+.1f} pts {_delta_label}"
-            if _prior_nps_delta is not None
-            else None
-        ),
-    )
-    # Total responses: neutral
-    c2.metric(
-        "Total Responses",
-        nps["total"],
-        delta=(
-            f"{_prior_vol_delta:+d} {_delta_label}"
-            if _prior_vol_delta is not None
-            else None
-        ),
-        delta_color="off",
-    )
-    # Promoter rate: higher is better → default delta_color is correct
-    c3.metric(
-        "Promoters",
-        f"{nps['promoter_pct']:.0f}%",
-        delta=(
-            f"{_prior_prom_delta:+.1f}pp {_delta_label}"
-            if _prior_prom_delta is not None
-            else None
-        ),
-        help="Score 9–10",
-    )
-    # Detractor rate: lower is better → inverse coloring
-    c4.metric(
-        "Detractors",
-        f"{nps['detractor_pct']:.0f}%",
-        delta=(
-            f"{_prior_det_delta:+.1f}pp {_delta_label}"
-            if _prior_det_delta is not None
-            else None
-        ),
-        delta_color="inverse",
-        help="Score 0–6 · lower is better · negative delta (↓) = improvement",
-    )
-    # Avg severity: lower is better → inverse coloring
-    c5.metric(
-        "Avg Severity",
-        f"{avg_sev:.1f}" if avg_sev else "—",
-        delta=(
-            f"{_prior_sev_delta:+.2f} {_delta_label}"
-            if _prior_sev_delta is not None
-            else None
-        ),
-        delta_color="inverse",
-    )
-
-    # Helper text: selected range + preceding comparison period
-    if not df.empty and "response_date" in df.columns:
-        _kpi_start = df["response_date"].min().strftime("%b %d, %Y")
-        _kpi_end = df["response_date"].max().strftime("%b %d, %Y")
-        _range_note = (
-            f"KPI metrics reflect the selected date range: **{_kpi_start} – {_kpi_end}**."
-        )
-        st.caption(
-            f"{_range_note} {_comparison_note}"
-            if _comparison_note
-            else f"{_range_note} Deltas compare against the immediately preceding "
-            "equivalent-length period."
+    # ── TEAM FILTER (scopes Location Issues + Top Issue Categories) ─────────
+    _team_options = sorted({
+        t.strip()
+        for owner in _COWNER_MAP.values()
+        for t in owner.split(" / ")
+        if owner != "N/A"
+    })
+    _tf_col, _ = st.columns([2, 5])
+    with _tf_col:
+        _selected_teams = st.multiselect(
+            "Team view",
+            options=_team_options,
+            default=[],
+            placeholder="All teams",
+            key="brief_team_filter",
+            help=(
+                "Filter Location Issues and Top Issue Categories to only show "
+                "problems owned by one or more selected teams. "
+                "Leave empty to see all."
+            ),
         )
 
-    # ── 2. DAILY DRILL-DOWN ───────────────────────────────────────────────────
+    # ── 2. LOCATION ISSUES REQUIRING INVESTIGATION ───────────────────────────
+    if not dev_df.empty and "is_flagged" in dev_df.columns:
+        _flagged = dev_df[dev_df["is_flagged"]].copy()
+        # Apply team filter — keep categories where ANY selected team appears in the owner string
+        if _selected_teams:
+            _flagged = _flagged[
+                _flagged["issue_category"].map(
+                    lambda _c: any(
+                        _t in _COWNER_MAP.get(_c, "") for _t in _selected_teams
+                    )
+                )
+            ].copy()
+        if not _flagged.empty:
+            st.markdown(
+                section_header(
+                    "📍 Location Issues Requiring Investigation",
+                    "Locations where a specific issue rate is ≥50% above the network average "
+                    "(min 3 responses)",
+                ),
+                unsafe_allow_html=True,
+            )
+            _sel_key = "brief_loc_selected"
+            if _sel_key not in st.session_state:
+                st.session_state[_sel_key] = None
+
+            ncols = min(3, len(_flagged))
+            loc_cols = st.columns(ncols)
+            _top3 = list(_flagged.head(3).iterrows())
+
+            for i, (_, _row) in enumerate(_top3):
+                _dev_pct = int(_row["deviation_score"] * 100)
+                _sev_color = CRITICAL_BORDER if _dev_pct > 100 else WARNING_BORDER
+                _loc = _row["member_location"]
+                _cat = _row["issue_category"]
+                _card_id = f"{_loc}||{_cat}"
+                _is_open = st.session_state[_sel_key] == _card_id
+
+                with loc_cols[i]:
+                    st.markdown(
+                        f'<div style="background:{CREAM};border:1px solid {_sev_color};'
+                        f"border-top:3px solid {_sev_color};border-radius:8px;"
+                        f'padding:14px 16px;margin-bottom:4px">'
+                        f'<div style="font-weight:700;color:{DARK};font-size:0.9rem">'
+                        f"{_loc}</div>"
+                        f'<div style="color:{_sev_color};font-weight:600;font-size:0.8rem;'
+                        f'margin-top:3px">{_cat}</div>'
+                        f'<div style="margin-top:8px;font-size:0.8rem;color:{DARK}">'
+                        f'<span style="font-size:1.4rem;font-weight:700;color:{_sev_color}">'
+                        f"+{_dev_pct}%</span> above network average</div>"
+                        f'<div style="color:{MEDIUM_GRAY};font-size:0.75rem;margin-top:6px">'
+                        f"{int(_row['loc_count'])} responses · "
+                        f"Location rate: {_row['loc_rate'] * 100:.1f}% · "
+                        f"Network avg: {_row['network_rate'] * 100:.1f}%</div>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+                    _btn_label = "▲ Hide details" if _is_open else "▼ View details"
+                    if st.button(_btn_label, key=f"loc_btn_{i}", use_container_width=True):
+                        st.session_state[_sel_key] = None if _is_open else _card_id
+                        st.rerun()
+
+            # Full-width detail panel — rendered outside columns
+            _active = st.session_state.get(_sel_key)
+            if _active:
+                _active_rows = [
+                    _r for _, _r in _top3
+                    if f"{_r['member_location']}||{_r['issue_category']}" == _active
+                ]
+                if _active_rows:
+                    _ar = _active_rows[0]
+                    _al = _ar["member_location"]
+                    _ac = _ar["issue_category"]
+                    _page_key = (
+                        "brief_loc_"
+                        + "_".join(_al.split())
+                        + "_"
+                        + _ac.split("/")[0].strip().replace(" ", "_")
+                        + "_page"
+                    )
+                    st.markdown("---")
+                    _render_loc_issue_detail(_al, _ac, _ar, df_full, _page_key)
+
+            # ── Additional flagged locations (4th onward) ─────────────────────
+            _remaining = list(_flagged.iloc[3:].iterrows())
+            if _remaining:
+                with st.expander(
+                    f"{len(_remaining)} more flagged location issues",
+                    expanded=False,
+                ):
+                    _rem_sel_key = "brief_loc_rem_selected"
+                    if _rem_sel_key not in st.session_state:
+                        st.session_state[_rem_sel_key] = None
+
+                    # Render in rows of 3
+                    for _rem_row_start in range(0, len(_remaining), 3):
+                        _rem_row = _remaining[_rem_row_start: _rem_row_start + 3]
+                        _rem_cols = st.columns(3)
+
+                        for _rci, (_, _rrow) in enumerate(_rem_row):
+                            _rdev_pct = int(_rrow["deviation_score"] * 100)
+                            _rsev_color = CRITICAL_BORDER if _rdev_pct > 100 else WARNING_BORDER
+                            _rloc = _rrow["member_location"]
+                            _rcat = _rrow["issue_category"]
+                            _rcard_id = f"{_rloc}||{_rcat}"
+                            _ris_open = st.session_state[_rem_sel_key] == _rcard_id
+
+                            with _rem_cols[_rci]:
+                                st.markdown(
+                                    f'<div style="background:{CREAM};border:1px solid {_rsev_color};'
+                                    f"border-top:3px solid {_rsev_color};border-radius:8px;"
+                                    f'padding:14px 16px;margin-bottom:4px">'
+                                    f'<div style="font-weight:700;color:{DARK};font-size:0.9rem">'
+                                    f"{_rloc}</div>"
+                                    f'<div style="color:{_rsev_color};font-weight:600;font-size:0.8rem;'
+                                    f'margin-top:3px">{_rcat}</div>'
+                                    f'<div style="margin-top:8px;font-size:0.8rem;color:{DARK}">'
+                                    f'<span style="font-size:1.4rem;font-weight:700;color:{_rsev_color}">'
+                                    f"+{_rdev_pct}%</span> above network average</div>"
+                                    f'<div style="color:{MEDIUM_GRAY};font-size:0.75rem;margin-top:6px">'
+                                    f"{int(_rrow['loc_count'])} responses · "
+                                    f"Location rate: {_rrow['loc_rate'] * 100:.1f}% · "
+                                    f"Network avg: {_rrow['network_rate'] * 100:.1f}%</div>"
+                                    f"</div>",
+                                    unsafe_allow_html=True,
+                                )
+                                _rbtn_label = "▲ Hide details" if _ris_open else "▼ View details"
+                                if st.button(
+                                    _rbtn_label,
+                                    key=f"loc_rem_btn_{_rem_row_start + _rci}",
+                                    use_container_width=True,
+                                ):
+                                    st.session_state[_rem_sel_key] = (
+                                        None if _ris_open else _rcard_id
+                                    )
+                                    st.rerun()
+
+                        # Full-width detail panel — below whichever row holds the active card
+                        _rem_active = st.session_state.get(_rem_sel_key)
+                        if _rem_active and any(
+                            f"{_rrow['member_location']}||{_rrow['issue_category']}" == _rem_active
+                            for _, _rrow in _rem_row
+                        ):
+                            _rem_ar = next(
+                                _rrow for _, _rrow in _rem_row
+                                if f"{_rrow['member_location']}||{_rrow['issue_category']}" == _rem_active
+                            )
+                            _rem_al = _rem_ar["member_location"]
+                            _rem_ac = _rem_ar["issue_category"]
+                            _rem_page_key = (
+                                "brief_loc_rem_"
+                                + "_".join(_rem_al.split())
+                                + "_"
+                                + _rem_ac.split("/")[0].strip().replace(" ", "_")
+                                + "_page"
+                            )
+                            st.markdown("---")
+                            _render_loc_issue_detail(
+                                _rem_al, _rem_ac, _rem_ar, df_full, _rem_page_key
+                            )
+
+
+    # ── LOCATION PROFILES (collapsible) ─────────────────────────────────────
+    if not health_df.empty:
+        with st.expander("📍 Location Profiles", expanded=False):
+            st.caption("Health summary and action steps for every location — sorted worst to best")
+
+            _lp_sel_key = "brief_profile_selected"
+            if _lp_sel_key not in st.session_state:
+                st.session_state[_lp_sel_key] = None
+
+            _lp_list = list(health_df.sort_values("health_score").iterrows())
+
+            for _lp_row_start in range(0, len(_lp_list), 3):
+                _lp_row_items = _lp_list[_lp_row_start: _lp_row_start + 3]
+                _lp_cols = st.columns(3)
+
+                for _lp_ci, (_, _hr) in enumerate(_lp_row_items):
+                    _ploc = _hr["member_location"]
+                    _phscore = float(_hr["health_score"])
+                    _pnps = _hr["avg_nps"]
+                    _psev = float(_hr["avg_severity"])
+                    _pdet = float(_hr["detractor_rate"])
+                    _pn = int(_hr["total_responses"])
+
+                    if _phscore < 45:
+                        _pstatus = "🔴 At Risk"
+                        _pcolor = CRITICAL_BORDER
+                    elif _phscore < 60:
+                        _pstatus = "🟡 Monitor"
+                        _pcolor = WARNING_BORDER
+                    else:
+                        _pstatus = "🟢 Healthy"
+                        _pcolor = "#22C55E"
+
+                    _pflagged_count = (
+                        len(dev_df[(dev_df["member_location"] == _ploc) & dev_df["is_flagged"]])
+                        if not dev_df.empty and "is_flagged" in dev_df.columns else 0
+                    )
+                    _pcard_id = _ploc
+                    _pis_open = st.session_state[_lp_sel_key] == _pcard_id
+
+                    with _lp_cols[_lp_ci]:
+                        _nps_disp = f"{_pnps:.0f}" if _pnps is not None else "—"
+                        st.markdown(
+                            f'<div style="background:{CREAM};border:1px solid {_pcolor};'
+                            f"border-top:3px solid {_pcolor};border-radius:8px;"
+                            f'padding:14px 16px;margin-bottom:4px">'
+                            f'<div style="font-weight:700;color:{DARK};font-size:0.9rem">'
+                            f"{_ploc}</div>"
+                            f'<div style="color:{_pcolor};font-weight:600;font-size:0.78rem;'
+                            f'margin-top:3px">{_pstatus} · {_phscore:.0f}/100</div>'
+                            f'<div style="margin-top:8px;font-size:0.8rem;color:{DARK}">'
+                            f"NPS {_nps_disp} · Avg sev {_psev:.1f} · {_pdet:.0%} detractors</div>"
+                            f'<div style="color:{MEDIUM_GRAY};font-size:0.75rem;margin-top:4px">'
+                            f"{_pn} responses"
+                            + (
+                                f' · <span style="color:{CRITICAL_BORDER};font-weight:600">'
+                                f"⚠ {_pflagged_count} flagged</span>"
+                                if _pflagged_count > 0 else ""
+                            )
+                            + f"</div></div>",
+                            unsafe_allow_html=True,
+                        )
+                        _lp_btn = "▲ Hide profile" if _pis_open else "▼ View profile"
+                        if st.button(
+                            _lp_btn,
+                            key=f"lp_btn_{_lp_row_start + _lp_ci}",
+                            use_container_width=True,
+                        ):
+                            st.session_state[_lp_sel_key] = (
+                                None if _pis_open else _pcard_id
+                            )
+                            st.rerun()
+
+                # Expand detail below whichever row contains the active card
+                _lp_active = st.session_state.get(_lp_sel_key)
+                if _lp_active and any(
+                    _hr["member_location"] == _lp_active for _, _hr in _lp_row_items
+                ):
+                    _lp_hrow = health_df[health_df["member_location"] == _lp_active]
+                    _lp_hrow_series = _lp_hrow.iloc[0] if not _lp_hrow.empty else None
+                    _lp_page_key = f"lp_page_{'_'.join(_lp_active.split())}"
+                    st.markdown("---")
+                    _render_location_profile_detail(
+                        loc=_lp_active,
+                        df_full=df_full,
+                        health_row=_lp_hrow_series,
+                        dev_df=dev_df,
+                        page_key=_lp_page_key,
+                    )
+                    st.markdown("---")
+
+    # ── TOP ISSUE CATEGORIES ─────────────────────────────────────────────────
+    # Uses the same ranking logic as the Top Issues tab: categories ranked by
+    # avg_severity (primary signal of operational impact), with count and
+    # detractor rate as supporting context on each card.
+    _all_issues = top_issues(df_full, n=20)   # fetch all; slice below
+    # Apply same team filter
+    if _selected_teams:
+        _all_issues = [
+            _iss for _iss in _all_issues
+            if any(_t in _COWNER_MAP.get(_iss["category"], "") for _t in _selected_teams)
+        ]
+    _top3_issues = _all_issues[:3]
+    _remaining_issues = _all_issues[3:]
+    if _top3_issues:
+        st.markdown("---")
+        st.markdown(
+            section_header(
+                "🔥 Top Issue Categories",
+                "Ranked by average severity across all responses — highest operational impact",
+            ),
+            unsafe_allow_html=True,
+        )
+        _cat_sel_key = "brief_cat_selected"
+        if _cat_sel_key not in st.session_state:
+            st.session_state[_cat_sel_key] = None
+
+        _ctcols = min(3, len(_top3_issues))
+        cat_cols = st.columns(_ctcols)
+
+        for i, _issue in enumerate(_top3_issues):
+            _ccat = _issue["category"]
+            _ccard_id = _ccat
+            _cis_open = st.session_state[_cat_sel_key] == _ccard_id
+            _cavg = float(_issue["avg_severity"])
+            _csev_color = CRITICAL_BORDER if _cavg >= 4.0 else WARNING_BORDER
+
+            with cat_cols[i]:
+                st.markdown(
+                    f'<div style="background:{CREAM};border:1px solid {_csev_color};'
+                    f"border-top:3px solid {_csev_color};border-radius:8px;"
+                    f'padding:14px 16px;margin-bottom:4px">'
+                    f'<div style="font-weight:700;color:{DARK};font-size:0.9rem">'
+                    f"{_ccat}</div>"
+                    f'<div style="color:{_csev_color};font-weight:600;font-size:0.8rem;'
+                    f'margin-top:3px">Avg severity {_cavg}</div>'
+                    f'<div style="margin-top:8px;font-size:0.8rem;color:{DARK}">'
+                    f'<span style="font-size:1.4rem;font-weight:700;color:{_csev_color}">'
+                    f"{_issue['count']}</span> responses</div>"
+                    f'<div style="color:{MEDIUM_GRAY};font-size:0.75rem;margin-top:6px">'
+                    f"{_issue['detractor_pct']:.0f}% detractor rate · "
+                    f"{_issue['churn_risk_count']} churn risk"
+                    f"</div></div>",
+                    unsafe_allow_html=True,
+                )
+                _cbtn_label = "▲ Hide details" if _cis_open else "▼ View details"
+                if st.button(_cbtn_label, key=f"cat_btn_{i}", use_container_width=True):
+                    st.session_state[_cat_sel_key] = None if _cis_open else _ccard_id
+                    st.rerun()
+
+        # Full-width detail panel — rendered outside columns
+        _cactive = st.session_state.get(_cat_sel_key)
+        if _cactive:
+            _cactive_items = [
+                (idx, iss) for idx, iss in enumerate(_top3_issues)
+                if iss["category"] == _cactive
+            ]
+            if _cactive_items:
+                _crank, _ = _cactive_items[0]
+                _cpage_key = (
+                    "brief_cat_"
+                    + _cactive.split("/")[0].strip().replace(" ", "_")
+                    + "_page"
+                )
+                st.markdown("---")
+                _render_cat_issue_detail(_cactive, _crank + 1, df_full, _cpage_key)
+
+        # ── Additional issue categories (4th onward) ──────────────────────────
+        if _remaining_issues:
+            with st.expander(
+                f"{len(_remaining_issues)} more issue categories",
+                expanded=False,
+            ):
+                _cat_rem_sel_key = "brief_cat_rem_selected"
+                if _cat_rem_sel_key not in st.session_state:
+                    st.session_state[_cat_rem_sel_key] = None
+
+                for _rem_row_start in range(0, len(_remaining_issues), 3):
+                    _rem_cat_row = _remaining_issues[_rem_row_start: _rem_row_start + 3]
+                    _rem_cat_cols = st.columns(3)
+
+                    for _rci, _rissue in enumerate(_rem_cat_row):
+                        _rccat = _rissue["category"]
+                        _rccard_id = _rccat
+                        _rcis_open = st.session_state[_cat_rem_sel_key] == _rccard_id
+                        _rcavg = float(_rissue["avg_severity"])
+                        _rcsev_color = (
+                            "#22C55E" if _rcavg < 3.0
+                            else CRITICAL_BORDER if _rcavg >= 4.0
+                            else WARNING_BORDER
+                        )
+
+                        with _rem_cat_cols[_rci]:
+                            st.markdown(
+                                f'<div style="background:{CREAM};border:1px solid {_rcsev_color};'
+                                f"border-top:3px solid {_rcsev_color};border-radius:8px;"
+                                f'padding:14px 16px;margin-bottom:4px">'
+                                f'<div style="font-weight:700;color:{DARK};font-size:0.9rem">'
+                                f"{_rccat}</div>"
+                                f'<div style="color:{_rcsev_color};font-weight:600;font-size:0.8rem;'
+                                f'margin-top:3px">Avg severity {_rcavg}</div>'
+                                f'<div style="margin-top:8px;font-size:0.8rem;color:{DARK}">'
+                                f'<span style="font-size:1.4rem;font-weight:700;color:{_rcsev_color}">'
+                                f"{_rissue['count']}</span> responses</div>"
+                                f'<div style="color:{MEDIUM_GRAY};font-size:0.75rem;margin-top:6px">'
+                                f"{_rissue['detractor_pct']:.0f}% detractor rate · "
+                                f"{_rissue['churn_risk_count']} churn risk"
+                                f"</div></div>",
+                                unsafe_allow_html=True,
+                            )
+                            _rcbtn_label = "▲ Hide details" if _rcis_open else "▼ View details"
+                            if st.button(
+                                _rcbtn_label,
+                                key=f"cat_rem_btn_{_rem_row_start + _rci}",
+                                use_container_width=True,
+                            ):
+                                st.session_state[_cat_rem_sel_key] = (
+                                    None if _rcis_open else _rccard_id
+                                )
+                                st.rerun()
+
+                    # Full-width detail panel — below whichever row holds the active card
+                    _rc_active = st.session_state.get(_cat_rem_sel_key)
+                    if _rc_active and any(
+                        iss["category"] == _rc_active for iss in _rem_cat_row
+                    ):
+                        _rc_rank = next(
+                            3 + _all_issues.index(iss)
+                            for iss in _rem_cat_row
+                            if iss["category"] == _rc_active
+                        )
+                        _rc_page_key = (
+                            "brief_cat_rem_"
+                            + _rc_active.split("/")[0].strip().replace(" ", "_")
+                            + "_page"
+                        )
+                        st.markdown("---")
+                        _render_cat_issue_detail(_rc_active, _rc_rank + 1, df_full, _rc_page_key)
+
+    # ── 3. DAILY DRILL-DOWN ───────────────────────────────────────────────────
     st.markdown("---")
     st.markdown(
         section_header("Daily Drill-Down", "Responses and criticals for a specific date"),
@@ -686,7 +1762,7 @@ def render_briefing_tab(
                     if trace.name == "":
                         trace.showlegend = False
                 fig_day_dist.update_layout(
-                    height=max(280, len(cat_order) * 38 + 80),
+                    height=max(180, len(cat_order) * 24 + 40),
                     margin=dict(t=10, b=10, l=0, r=20),
                     plot_bgcolor=WHITE,
                     paper_bgcolor=WHITE,
@@ -716,7 +1792,7 @@ def render_briefing_tab(
                             alert_box(
                                 "Critical",
                                 f"{c['response_id']} · {c['member_location']} · NPS {c.get('nps_score', '—')}",
-                                f"<em>{c.get('feedback_text', '')[:220]}…</em>",
+                                f"<em>{c.get('feedback_text', '')}</em>",
                                 meta=f"Category: {c.get('category', '—')} · "
                                 f"Severity: {c.get('severity_score')} · {c.get('trigger', '')}",
                             ),
@@ -733,355 +1809,299 @@ def render_briefing_tab(
                         unsafe_allow_html=True,
                     )
 
-            quotes = digest.get("notable_quotes", [])
-            if quotes:
-                st.markdown(
-                    section_header(
-                        "Notable Quotes",
-                        "Responses with AI-assigned severity ≥ 4, sorted highest first",
-                    ),
-                    unsafe_allow_html=True,
-                )
-                for q in quotes:
-                    sev_color = SEVERITY_COLORS.get(q["severity"], MEDIUM_GRAY)
-                    st.markdown(
-                        f'<div style="border-left:3px solid {sev_color};padding:10px 14px;'
-                        f"margin-bottom:8px;background:{CREAM};border-radius:0 6px 6px 0\">"
-                        f'<span style="font-size:0.75rem;color:{MEDIUM_GRAY}">'
-                        f"{q['response_id']} · {q['location']} · NPS {q.get('nps_score', '—')} · "
-                        f'<strong style="color:{sev_color}">Severity {q["severity"]}</strong> · '
-                        f"{q.get('category', '')}</span><br>"
-                        f'<span style="font-size:0.875rem;color:{DARK}">{q["text"][:280]}</span>'
-                        f"</div>",
-                        unsafe_allow_html=True,
-                    )
 
-    # ── 3 & 4: Build 6-month unfiltered slice for trend charts ───────────────
-    six_mo_cutoff = df_full["response_date"].max() - pd.Timedelta(weeks=26)
-    df_6mo = df_full[df_full["response_date"] >= six_mo_cutoff].copy()
-    six_mo_label = "Last 6 months · unaffected by date / location filters"
-
-    # ── 3. NPS DISTRIBUTION + RESPONSE VOLUME ────────────────────────────────
+    # ── KPI STRIP ────────────────────────────────────────────────────────────
     st.markdown("---")
-    ch_l, ch_r = st.columns([1, 1])
-
-    with ch_l:
-        st.markdown(
-            section_header("NPS Score Distribution", "Response count by score"),
-            unsafe_allow_html=True,
-        )
-        scored = df[df["nps_score"].notna()].copy()
-        scored["nps_score"] = scored["nps_score"].astype(int)
-        score_counts = (
-            scored.groupby("nps_score").size().reset_index(name="count").sort_values("nps_score")
-        )
-        score_counts["color"] = score_counts["nps_score"].apply(
-            lambda s: "#22C55E" if s >= 9 else "#6B7280" if s >= 7 else CRITICAL_BORDER
-        )
-        fig_dist = go.Figure(
-            go.Bar(
-                x=score_counts["nps_score"],
-                y=score_counts["count"],
-                marker_color=score_counts["color"].tolist(),
-                hovertemplate="Score %{x}: %{y} responses<extra></extra>",
-            )
-        )
-        fig_dist.update_layout(
-            height=300,
-            xaxis=dict(title="NPS Score", tickmode="linear", dtick=1),
-            yaxis=dict(title="Responses"),
-            plot_bgcolor=WHITE,
-            paper_bgcolor=WHITE,
-            margin=dict(t=10, b=40, l=40, r=10),
-        )
-        st.plotly_chart(fig_dist, use_container_width=True)
-
-    with ch_r:
-        st.markdown(
-            section_header("Response Volume Over Time", six_mo_label),
-            unsafe_allow_html=True,
-        )
-        weekly_6mo = weekly_summary(df_6mo)
-        if not weekly_6mo.empty:
-            fig_vol = go.Figure()
-            fig_vol.add_trace(
-                go.Scatter(
-                    x=weekly_6mo["week_label"],
-                    y=weekly_6mo["response_count"],
-                    mode="lines+markers",
-                    line=dict(color=PRIMARY, width=2),
-                    marker=dict(size=6),
-                    hovertemplate="%{x}<br>%{y} responses<extra></extra>",
-                )
-            )
-            fig_vol.update_layout(
-                height=300,
-                xaxis=dict(title="", tickangle=-45),
-                yaxis=dict(title="Responses"),
-                plot_bgcolor=WHITE,
-                paper_bgcolor=WHITE,
-                margin=dict(t=10, b=60, l=40, r=10),
-                showlegend=False,
-            )
-            st.plotly_chart(fig_vol, use_container_width=True)
-
-    # ── 4. SENTIMENT OVER TIME + ISSUE VELOCITY (side by side) ─────────────
-    st.markdown("---")
-    _col_sent, _col_vel = st.columns([1, 1])
-
-    with _col_sent:
-        st.markdown(
-            section_header("Sentiment Distribution Over Time", six_mo_label),
-            unsafe_allow_html=True,
-        )
-        sent_time = sentiment_over_time(df_6mo)
-        if not sent_time.empty:
-            pivot = sent_time.pivot_table(
-                index="week_label", columns="sentiment", values="count", fill_value=0
-            ).reset_index()
-            sent_colors = {
-                "Positive": "#22C55E",
-                "Neutral": "#6B7280",
-                "Mixed": WARNING_BORDER,
-                "Negative": CRITICAL_BORDER,
-            }
-            fig_sent = go.Figure()
-            for sent in ["Negative", "Mixed", "Neutral", "Positive"]:
-                if sent in pivot.columns:
-                    fig_sent.add_trace(
-                        go.Bar(
-                            name=sent,
-                            x=pivot["week_label"],
-                            y=pivot[sent],
-                            marker_color=sent_colors.get(sent, MEDIUM_GRAY),
-                            hovertemplate=f"{sent}: %{{y}}<extra></extra>",
-                        )
-                    )
-            fig_sent.update_layout(
-                barmode="stack",
-                height=340,
-                xaxis=dict(title="", tickangle=-45),
-                yaxis=dict(title="Responses"),
-                plot_bgcolor=WHITE,
-                paper_bgcolor=WHITE,
-                margin=dict(t=10, b=60, l=40, r=10),
-                legend=dict(orientation="h", y=1.08),
-            )
-            st.plotly_chart(fig_sent, use_container_width=True)
-
-    with _col_vel:
-        st.markdown(
-            section_header("Issue Velocity", "Week-over-week rate change by category"),
-            unsafe_allow_html=True,
-        )
-        _vel_rates = weekly_category_rates(df)
-        _vel = issue_velocity(_vel_rates if not _vel_rates.empty else weekly_category_rates(df))
-        if not _vel.empty:
-            _vel_latest = (
-                _vel[_vel["week_start"].notna()]
-                .sort_values("week_start")
-                .groupby("issue_category")
-                .last()
-                .reset_index()
-                [["issue_category", "rate_change", "pct_change"]]
-                .dropna(subset=["rate_change"])
-                .sort_values("rate_change", ascending=False)
-                .head(10)
-            )
-            _vel_latest["rate_change_pct"] = _vel_latest["rate_change"] * 100
-            _vel_latest["color"] = _vel_latest["rate_change"].apply(
-                lambda v: CRITICAL_BORDER if v > 0 else "#22C55E"
-            )
-            fig_vel = go.Figure(go.Bar(
-                x=_vel_latest["rate_change_pct"],
-                y=_vel_latest["issue_category"],
-                orientation="h",
-                marker_color=_vel_latest["color"].tolist(),
-                hovertemplate="%{y}: %{x:+.1f}pp<extra></extra>",
-            ))
-            fig_vel.update_layout(
-                height=340,
-                xaxis=dict(title="Rate change (pp)", ticksuffix="pp"),
-                yaxis=dict(autorange="reversed"),
-                plot_bgcolor=WHITE,
-                paper_bgcolor=WHITE,
-                margin=dict(t=10, b=40, l=0, r=20),
-            )
-            st.plotly_chart(fig_vel, use_container_width=True)
-
-    # ── 5. ISSUE DISTRIBUTION (filtered period) ─────────────────────────────
-    st.markdown("---")
-    st.markdown(
-        section_header(
-            "Issue Distribution",
-            "Filtered period · all operational categories stacked by subcategory",
+    c1, c2, c3, c4, c5 = st.columns(5)
+    nps_val = nps["nps"]
+    c1.metric(
+        "NPS Score",
+        f"{nps_val:.0f}" if nps_val is not None else "—",
+        delta=(
+            f"{_prior_nps_delta:+.1f} pts {_delta_label}"
+            if _prior_nps_delta is not None
+            else None
         ),
-        unsafe_allow_html=True,
     )
-    _op_cats_display = [c for c in _OP_CATS if c not in _EXCL]
-    _op_df = df[~df["issue_category"].isin(_EXCL)] if "issue_category" in df.columns else pd.DataFrame()
-
-    if not _op_df.empty and "issue_subcategory" in _op_df.columns:
-        _dist_actual = (
-            _op_df.groupby(["issue_category", "issue_subcategory"])["response_id"]
-            .count()
-            .reset_index(name="count")
-        )
-    else:
-        _dist_actual = pd.DataFrame(columns=["issue_category", "issue_subcategory", "count"])
-
-    _existing = set(_dist_actual["issue_category"].unique())
-    _placeholders = [
-        {"issue_category": c, "issue_subcategory": "", "count": 0}
-        for c in _op_cats_display if c not in _existing
-    ]
-    if _placeholders:
-        _dist_actual = pd.concat([_dist_actual, pd.DataFrame(_placeholders)], ignore_index=True)
-
-    _cat_totals = _dist_actual.groupby("issue_category")["count"].sum()
-    _cat_order = (
-        pd.Series({c: _cat_totals.get(c, 0) for c in _op_cats_display})
-        .sort_values(ascending=True)
-        .index.tolist()
-    )
-
-    _palette = px.colors.qualitative.Safe + px.colors.qualitative.Pastel
-    _all_subs = [sub for c in _op_cats_display for sub in _SUBCAT_MAP.get(c, [])]
-    _sub_colors = {sub: _palette[i % len(_palette)] for i, sub in enumerate(_all_subs)}
-    _sub_colors[""] = "rgba(0,0,0,0)"
-
-    fig_brief_dist = px.bar(
-        _dist_actual,
-        x="count",
-        y="issue_category",
-        color="issue_subcategory",
-        orientation="h",
-        barmode="stack",
-        color_discrete_map=_sub_colors,
-        category_orders={"issue_category": _cat_order},
-        labels={"count": "Responses", "issue_category": "", "issue_subcategory": "Subcategory"},
-    )
-    for trace in fig_brief_dist.data:
-        if trace.name == "":
-            trace.showlegend = False
-    fig_brief_dist.update_layout(
-        height=max(280, len(_cat_order) * 38 + 80),
-        margin=dict(t=10, b=10, l=0, r=20),
-        plot_bgcolor=WHITE,
-        paper_bgcolor=WHITE,
-        legend=dict(
-            orientation="v", x=1.01, y=1.0,
-            font=dict(size=10),
-            title=dict(text="Subcategory", font=dict(size=10)),
+    c2.metric(
+        "Total Responses",
+        nps["total"],
+        delta=(
+            f"{_prior_vol_delta:+d} {_delta_label}"
+            if _prior_vol_delta is not None
+            else None
         ),
-        xaxis=dict(title="Responses"),
+        delta_color="off",
     )
-    st.plotly_chart(fig_brief_dist, use_container_width=True)
+    c3.metric(
+        "Promoters",
+        f"{nps['promoter_pct']:.0f}%",
+        delta=(
+            f"{_prior_prom_delta:+.1f}pp {_delta_label}"
+            if _prior_prom_delta is not None
+            else None
+        ),
+        help="Score 9–10",
+    )
+    c4.metric(
+        "Detractors",
+        f"{nps['detractor_pct']:.0f}%",
+        delta=(
+            f"{_prior_det_delta:+.1f}pp {_delta_label}"
+            if _prior_det_delta is not None
+            else None
+        ),
+        delta_color="inverse",
+        help="Score 0–6 · lower is better · negative delta (↓) = improvement",
+    )
+    c5.metric(
+        "Avg Severity",
+        f"{avg_sev:.1f}" if avg_sev else "—",
+        delta=(
+            f"{_prior_sev_delta:+.2f} {_delta_label}"
+            if _prior_sev_delta is not None
+            else None
+        ),
+        delta_color="inverse",
+    )
+    if not df.empty and "response_date" in df.columns:
+        _kpi_start = df["response_date"].min().strftime("%b %d, %Y")
+        _kpi_end = df["response_date"].max().strftime("%b %d, %Y")
+        _range_note = (
+            f"KPI metrics reflect the selected date range: **{_kpi_start} – {_kpi_end}**."
+        )
+        st.caption(
+            f"{_range_note} {_comparison_note}"
+            if _comparison_note
+            else f"{_range_note} Deltas compare against the immediately preceding "
+            "equivalent-length period."
+        )
 
-    # ── 6. LOCATION ISSUES REQUIRING INVESTIGATION ───────────────────────────
-    if not dev_df.empty and "is_flagged" in dev_df.columns:
-        flagged_locs = dev_df[dev_df["is_flagged"]].copy()
-        if not flagged_locs.empty:
-            st.markdown("---")
+    # ── CHARTS (collapsible) ─────────────────────────────────────────────────
+    st.markdown("---")
+    with st.expander("📊 Charts", expanded=False):
+        # ── Build 6-month unfiltered slice for trend charts ──────────────────
+        six_mo_cutoff = df_full["response_date"].max() - pd.Timedelta(weeks=26)
+        df_6mo = df_full[df_full["response_date"] >= six_mo_cutoff].copy()
+        six_mo_label = "Last 6 months · unaffected by date / location filters"
+
+        # ── NPS DISTRIBUTION + RESPONSE VOLUME ───────────────────────────────
+        ch_l, ch_r = st.columns([1, 1])
+
+        with ch_l:
             st.markdown(
-                section_header(
-                    "📍 Location Issues Requiring Investigation",
-                    "Locations where a specific issue rate is ≥50% above the network average "
-                    "(min 3 responses)",
-                ),
+                section_header("NPS Score Distribution", "Response count by score"),
                 unsafe_allow_html=True,
             )
-            ncols = min(3, len(flagged_locs))
-            loc_cols = st.columns(ncols)
-            for i, (_, row) in enumerate(flagged_locs.head(3).iterrows()):
-                dev_pct = int(row["deviation_score"] * 100)
-                sev_color = CRITICAL_BORDER if dev_pct > 100 else WARNING_BORDER
-                with loc_cols[i]:
-                    st.markdown(
-                        f'<div style="background:{CREAM};border:1px solid {sev_color};'
-                        f"border-top:3px solid {sev_color};border-radius:8px;"
-                        f'padding:14px 16px;margin-bottom:12px">'
-                        f'<div style="font-weight:700;color:{DARK};font-size:0.9rem">'
-                        f"{row['member_location']}</div>"
-                        f'<div style="color:{sev_color};font-weight:600;font-size:0.8rem;'
-                        f'margin-top:3px">{row["issue_category"]}</div>'
-                        f'<div style="margin-top:8px;font-size:0.8rem;color:{DARK}">'
-                        f'<span style="font-size:1.4rem;font-weight:700;color:{sev_color}">'
-                        f"+{dev_pct}%</span> above network average</div>"
-                        f'<div style="color:{MEDIUM_GRAY};font-size:0.75rem;margin-top:6px">'
-                        f"{row['loc_count']} responses · "
-                        f"Location rate: {row['loc_rate'] * 100:.1f}% · "
-                        f"Network avg: {row['network_rate'] * 100:.1f}%</div>"
-                        f"</div>",
-                        unsafe_allow_html=True,
-                    )
-
-    # ── 7. PERSISTENT LOCATION ISSUES ────────────────────────────────────────
-    if not persist_df.empty:
-        st.markdown(
-            section_header(
-                "🔁 Persistent Location Issues",
-                "Problems ranking in the top 3 for their location for multiple consecutive weeks "
-                "— these are systemic, not one-off",
-            ),
-            unsafe_allow_html=True,
-        )
-        p_cols = st.columns(2)
-        for i, (_, row) in enumerate(persist_df.head(4).iterrows()):
-            with p_cols[i % 2]:
-                st.markdown(
-                    alert_box(
-                        "Warning",
-                        f"{row['member_location']} — {row['issue_category']}",
-                        f"Ranked as a top-3 issue at this location for "
-                        f"<strong>{row['max_consecutive_weeks']} consecutive weeks</strong>. "
-                        "This pattern indicates a systemic operational problem, not random variation.",
-                        meta=f"Total weeks in top-3: {row['weeks_in_top3']}",
-                    ),
-                    unsafe_allow_html=True,
+            scored = df[df["nps_score"].notna()].copy()
+            scored["nps_score"] = scored["nps_score"].astype(int)
+            score_counts = (
+                scored.groupby("nps_score").size().reset_index(name="count").sort_values("nps_score")
+            )
+            score_counts["color"] = score_counts["nps_score"].apply(
+                lambda s: "#22C55E" if s >= 9 else "#6B7280" if s >= 7 else CRITICAL_BORDER
+            )
+            fig_dist = go.Figure(
+                go.Bar(
+                    x=score_counts["nps_score"],
+                    y=score_counts["count"],
+                    marker_color=score_counts["color"].tolist(),
+                    hovertemplate="Score %{x}: %{y} responses<extra></extra>",
                 )
+            )
+            fig_dist.update_layout(
+                height=300,
+                xaxis=dict(title="NPS Score", tickmode="linear", dtick=1),
+                yaxis=dict(title="Responses"),
+                plot_bgcolor=WHITE,
+                paper_bgcolor=WHITE,
+                margin=dict(t=10, b=40, l=40, r=10),
+            )
+            st.plotly_chart(fig_dist, use_container_width=True)
 
-    # ── 8. SUGGESTED INVESTIGATIONS & ACTIONS ────────────────────────────────
-    if "suggested_operational_action" in df.columns:
+        with ch_r:
+            st.markdown(
+                section_header("Response Volume Over Time", six_mo_label),
+                unsafe_allow_html=True,
+            )
+            weekly_6mo = weekly_summary(df_6mo)
+            if not weekly_6mo.empty:
+                fig_vol = go.Figure()
+                fig_vol.add_trace(
+                    go.Scatter(
+                        x=weekly_6mo["week_label"],
+                        y=weekly_6mo["response_count"],
+                        mode="lines+markers",
+                        line=dict(color=PRIMARY, width=2),
+                        marker=dict(size=6),
+                        hovertemplate="%{x}<br>%{y} responses<extra></extra>",
+                    )
+                )
+                fig_vol.update_layout(
+                    height=300,
+                    xaxis=dict(title="", tickangle=-45),
+                    yaxis=dict(title="Responses"),
+                    plot_bgcolor=WHITE,
+                    paper_bgcolor=WHITE,
+                    margin=dict(t=10, b=60, l=40, r=10),
+                    showlegend=False,
+                )
+                st.plotly_chart(fig_vol, use_container_width=True)
+
+        # ── SENTIMENT OVER TIME + ISSUE VELOCITY (side by side) ─────────────
+        st.markdown("---")
+        _col_sent, _col_vel = st.columns([1, 1])
+
+        with _col_sent:
+            st.markdown(
+                section_header("Sentiment Distribution Over Time", six_mo_label),
+                unsafe_allow_html=True,
+            )
+            sent_time = sentiment_over_time(df_6mo)
+            if not sent_time.empty:
+                pivot = sent_time.pivot_table(
+                    index="week_label", columns="sentiment", values="count", fill_value=0
+                ).reset_index()
+                sent_colors = {
+                    "Positive": "#22C55E",
+                    "Neutral": "#6B7280",
+                    "Mixed": WARNING_BORDER,
+                    "Negative": CRITICAL_BORDER,
+                }
+                fig_sent = go.Figure()
+                for sent in ["Negative", "Mixed", "Neutral", "Positive"]:
+                    if sent in pivot.columns:
+                        fig_sent.add_trace(
+                            go.Bar(
+                                name=sent,
+                                x=pivot["week_label"],
+                                y=pivot[sent],
+                                marker_color=sent_colors.get(sent, MEDIUM_GRAY),
+                                hovertemplate=f"{sent}: %{{y}}<extra></extra>",
+                            )
+                        )
+                fig_sent.update_layout(
+                    barmode="stack",
+                    height=340,
+                    xaxis=dict(title="", tickangle=-45),
+                    yaxis=dict(title="Responses"),
+                    plot_bgcolor=WHITE,
+                    paper_bgcolor=WHITE,
+                    margin=dict(t=10, b=60, l=40, r=10),
+                    legend=dict(orientation="h", y=1.08),
+                )
+                st.plotly_chart(fig_sent, use_container_width=True)
+
+        with _col_vel:
+            st.markdown(
+                section_header("Issue Velocity", "Week-over-week rate change by category"),
+                unsafe_allow_html=True,
+            )
+            _vel_rates = weekly_category_rates(df)
+            _vel = issue_velocity(_vel_rates if not _vel_rates.empty else weekly_category_rates(df))
+            if not _vel.empty:
+                _vel_latest = (
+                    _vel[_vel["week_start"].notna()]
+                    .sort_values("week_start")
+                    .groupby("issue_category")
+                    .last()
+                    .reset_index()
+                    [["issue_category", "rate_change", "pct_change"]]
+                    .dropna(subset=["rate_change"])
+                    .sort_values("rate_change", ascending=False)
+                    .head(10)
+                )
+                _vel_latest["rate_change_pct"] = _vel_latest["rate_change"] * 100
+                _vel_latest["color"] = _vel_latest["rate_change"].apply(
+                    lambda v: CRITICAL_BORDER if v > 0 else "#22C55E"
+                )
+                fig_vel = go.Figure(go.Bar(
+                    x=_vel_latest["rate_change_pct"],
+                    y=_vel_latest["issue_category"],
+                    orientation="h",
+                    marker_color=_vel_latest["color"].tolist(),
+                    hovertemplate="%{y}: %{x:+.1f}pp<extra></extra>",
+                ))
+                fig_vel.update_layout(
+                    height=340,
+                    xaxis=dict(title="Rate change (pp)", ticksuffix="pp"),
+                    yaxis=dict(autorange="reversed"),
+                    plot_bgcolor=WHITE,
+                    paper_bgcolor=WHITE,
+                    margin=dict(t=10, b=40, l=0, r=20),
+                )
+                st.plotly_chart(fig_vel, use_container_width=True)
+
+        # ── ISSUE DISTRIBUTION (filtered period) ─────────────────────────────
         st.markdown("---")
         st.markdown(
             section_header(
-                "🔧 Suggested Investigations & Actions",
-                "Recommended next steps based on the highest-severity responses — "
-                "generated by AI analysis",
+                "Issue Distribution",
+                "Filtered period · all operational categories stacked by subcategory",
             ),
             unsafe_allow_html=True,
         )
-        action_df = (
-            df[
-                df["suggested_operational_action"].str.strip().ne("")
-                & df["severity_score"].notna()
-                & ~df["issue_category"].isin({"No Comment", "Positive Feedback"})
-            ]
-            .sort_values("severity_score", ascending=False)
-            .drop_duplicates(subset=["suggested_operational_action"])
-            .head(6)
+        _op_cats_display = [c for c in _OP_CATS if c not in _EXCL]
+        _op_df = df[~df["issue_category"].isin(_EXCL)] if "issue_category" in df.columns else pd.DataFrame()
+
+        if not _op_df.empty and "issue_subcategory" in _op_df.columns:
+            _dist_actual = (
+                _op_df.groupby(["issue_category", "issue_subcategory"])["response_id"]
+                .count()
+                .reset_index(name="count")
+            )
+        else:
+            _dist_actual = pd.DataFrame(columns=["issue_category", "issue_subcategory", "count"])
+
+        _existing = set(_dist_actual["issue_category"].unique())
+        _placeholders = [
+            {"issue_category": c, "issue_subcategory": "", "count": 0}
+            for c in _op_cats_display if c not in _existing
+        ]
+        if _placeholders:
+            _dist_actual = pd.concat([_dist_actual, pd.DataFrame(_placeholders)], ignore_index=True)
+
+        _cat_totals = _dist_actual.groupby("issue_category")["count"].sum()
+        _cat_order = (
+            pd.Series({c: _cat_totals.get(c, 0) for c in _op_cats_display})
+            .sort_values(ascending=True)
+            .index.tolist()
         )
-        if not action_df.empty:
-            for _, row in action_df.iterrows():
-                sev = int(row["severity_score"])
-                sev_color = SEVERITY_COLORS.get(sev, MEDIUM_GRAY)
-                st.markdown(
-                    f'<div style="display:flex;align-items:flex-start;gap:14px;'
-                    f"padding:12px 0;border-bottom:1px solid {LIGHT_GRAY}\">"
-                    f'<div style="min-width:34px;height:34px;border-radius:50%;'
-                    f"background:{sev_color};color:white;font-weight:700;font-size:0.8rem;"
-                    f'display:flex;align-items:center;justify-content:center;flex-shrink:0">'
-                    f"SEV {sev}</div>"
-                    f"<div>"
-                    f'<div style="font-size:0.88rem;color:{DARK};font-weight:500">'
-                    f"{row['suggested_operational_action']}</div>"
-                    f'<div style="font-size:0.73rem;color:{MEDIUM_GRAY};margin-top:3px">'
-                    f"{row.get('issue_category', '')} · {row.get('member_location', '')} · "
-                    f"Owner: {row.get('recommended_owner', '')} · {row.get('response_id', '')}"
-                    f"</div></div></div>",
-                    unsafe_allow_html=True,
-                )
+
+        _palette = px.colors.qualitative.Safe + px.colors.qualitative.Pastel
+        _all_subs = [sub for c in _op_cats_display for sub in _SUBCAT_MAP.get(c, [])]
+        _sub_colors = {sub: _palette[i % len(_palette)] for i, sub in enumerate(_all_subs)}
+        _sub_colors[""] = "rgba(0,0,0,0)"
+
+        fig_brief_dist = px.bar(
+            _dist_actual,
+            x="count",
+            y="issue_category",
+            color="issue_subcategory",
+            orientation="h",
+            barmode="stack",
+            color_discrete_map=_sub_colors,
+            category_orders={"issue_category": _cat_order},
+            labels={"count": "Responses", "issue_category": "", "issue_subcategory": "Subcategory"},
+        )
+        for trace in fig_brief_dist.data:
+            if trace.name == "":
+                trace.showlegend = False
+        fig_brief_dist.update_layout(
+            height=max(280, len(_cat_order) * 38 + 80),
+            margin=dict(t=10, b=10, l=0, r=20),
+            plot_bgcolor=WHITE,
+            paper_bgcolor=WHITE,
+            legend=dict(
+                orientation="v", x=1.01, y=1.0,
+                font=dict(size=10),
+                title=dict(text="Subcategory", font=dict(size=10)),
+            ),
+            xaxis=dict(title="Responses"),
+        )
+        st.plotly_chart(fig_brief_dist, use_container_width=True)
+
+
 
 
 def render_top_issues_tab(df: pd.DataFrame) -> None:
@@ -1638,7 +2658,6 @@ def render_segments_tab(
             st.info("Run analysis to see location deviation data.")
 
 
-
 def render_responses_tab(df: pd.DataFrame) -> None:
     """Filterable table of every response with all AI-generated fields."""
     st.markdown(
@@ -1985,10 +3004,6 @@ def main() -> None:
         else:
             df_raw, load_warnings = _load_raw()
 
-    if load_warnings:
-        with st.expander("⚠ Data quality notices", expanded=False):
-            for w in load_warnings:
-                st.caption(f"• {w}")
 
     # Check analysis state up front so we can enrich df before filtering
     stats = cache_stats(CACHE_PATH)
@@ -2015,6 +3030,10 @@ def main() -> None:
     # Sidebar + filters — pass enriched df so the filtered result carries analysis columns
     df_filtered, filters = render_sidebar(df_enriched)
 
+    # Make API key available to helper functions via session_state
+    if filters["api_key"]:
+        st.session_state["_api_key"] = filters["api_key"]
+
     # Run analysis if triggered
     if filters["api_key"]:
         maybe_run_analysis(df_raw, filters["api_key"])
@@ -2039,16 +3058,6 @@ def main() -> None:
     dev_df = m["dev"]
     persist_df = m["persist"]
 
-    # ── Persistent critical alert banner ────────────────────────────────────
-    critical_alerts = [a for a in all_alerts if a.get("tier") == "Critical"]
-    if critical_alerts:
-        cat_names = list(dict.fromkeys(a["category"] for a in critical_alerts))[:3]
-        extras = len(critical_alerts) - len(cat_names)
-        cat_str = ", ".join(cat_names) + (f" +{extras} more" if extras > 0 else "")
-        st.error(
-            f"🔴 **{len(critical_alerts)} Critical Alert{'s' if len(critical_alerts) > 1 else ''}**"
-            f" — {cat_str}. Open the **🚨 Alerts** tab for details and recommended actions."
-        )
 
     # Tabs
     tabs = st.tabs([
@@ -2063,7 +3072,7 @@ def main() -> None:
     ])
 
     with tabs[0]:
-        render_briefing_tab(df_filtered, all_alerts, dev_df, persist_df, df_enriched)
+        render_briefing_tab(df_filtered, all_alerts, dev_df, persist_df, df_enriched, health_df)
     with tabs[1]:
         render_top_issues_tab(df_filtered)
     with tabs[2]:

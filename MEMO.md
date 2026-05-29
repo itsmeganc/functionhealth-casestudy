@@ -1,83 +1,40 @@
 # PreventativeScan Feedback Analysis Tool — Documentation Memo
 
-**To:** Barbara Chirila, Martine White
-**From:** Megan Carroll
-**Date:** May 22, 2026
-**Re:** Automated Feedback Analysis Tool — Submission
+**To:** Barbara Chirila, Martine White  **·**  **From:** Megan Carroll  **·**  **Date:** May 22, 2026
 
 ---
 
 ## What It Does
 
-The tool takes the 500-response NPS CSV, runs every piece of feedback through Claude AI, and classifies it across 12 operational categories (Scheduling, Communication, Billing, Clinical, etc.) — assigning severity scores, sentiment, churn risk flags, root cause hypotheses, and recommended team owners. Everything surfaces in an interactive dashboard built for daily use: load new responses, run analysis, and within minutes you can see what's broken, where it's happening, and who should own the fix.
-
----
+The tool ingests the NPS feedback CSV, runs every response through Claude AI, and classifies it across 12 operational categories with severity scores, sentiment, churn risk flags, root cause hypotheses, and recommended team owners. Everything surfaces in an interactive dashboard built for daily monitoring — load new responses, run analysis, and within minutes you can see what's broken, where it's happening, and who should own the fix. Live demo (no setup required): https://functionhealth-casestudy-o3nfmsemkrfsbei8wyeauz.streamlit.app
 
 ## How to Use It
 
-A live version of the tool is hosted at the link included in this submission. All 500 responses have been pre-analyzed and the full dashboard is immediately accessible — no API key or setup required to explore it.
+Start on the **Briefing tab** — KPI strip with prior-period deltas, sentiment trends, and active alerts. **Top Issues** shows the 5 highest-severity categories with subcategory breakdowns, root causes, and suggested actions. **Alerts** routes Critical / Warning / Watchlist items to the responsible team. **Segments** flags locations running ≥50% above the network average on any issue category. **Export** downloads the full enriched dataset or alerts as CSV/Excel. Full setup instructions are in the README at https://github.com/itsmeganc/functionhealth-casestudy.
 
-To run it locally:
-1. `pip install -r requirements.txt` → add Anthropic API key to `.env` → `streamlit run app.py`
-2. Click **Run Analysis** on first load (~3–5 min for 500 responses; cached after that)
-3. Use the **Briefing tab** as the daily starting point — KPI strip with prior-period deltas, sentiment trends, issue velocity, and active alert callouts
-4. **Top Issues tab** shows the 5 highest-severity categories with subcategory breakdowns and example quotes
-5. **Alerts tab** routes Critical / Warning / Watchlist items to the responsible team
-6. **Segments tab** flags locations deviating ≥50% above the network average
-7. **Export tab** downloads the full enriched dataset, daily digest, or alerts as CSV/Excel for stakeholder distribution
+## Output of the Analysis
 
----
+Running the tool on the 500-response dataset surfaced several clear patterns. Scheduling and Communication issues drove the highest severity scores and generated the most Critical alerts — pointing to booking system failures and unresponsive support as the primary churn drivers. Multiple locations showed statistically significant deviations from the network average, with certain cities consistently over-indexing on specific issue categories week over week. The control charts flagged out-of-control signals in Staff/Clinical Experience at select locations, indicating localized problems rather than systemic ones. Promoter responses clustered around fast results, clinical reassurance, and smooth end-to-end experiences — a clear signal of what's working. Full classified output and alerts are included as attachments.
 
 ## Technical Decisions
 
-**Claude API over open-source models:** Accuracy and few-shot classification quality significantly outperforms smaller open models for nuanced healthcare feedback. The prompt includes category definitions, disambiguation rules, and worked examples to minimize ambiguous fallbacks and ensure consistent categorization across response types.
+**Claude API for classification:** Few-shot prompting with category definitions and worked examples produces consistent categorization that smaller open-source models can't reliably match for nuanced healthcare feedback.
 
-**Batch caching:** Each response is classified once and stored locally. Re-runs only process new responses, making daily incremental ingestion fast and cost-efficient (< $0.10 for 500 responses).
+**p-chart SPC for anomaly detection:** I chose statistical process control over static thresholds because static thresholds break at scale — a 5% cutoff set today is miscalibrated in six months as volume grows. SPC calculates limits from historical baselines and self-adjusts as data accumulates, making it a durable monitoring tool for a scaling company rather than one requiring constant manual recalibration.
 
-**p-chart statistical process control for anomaly detection:** Rather than static thresholds (e.g., ">5% of feedback"), the tool uses p-chart SPC — a methodology designed for monitoring proportions over time with variable sample sizes. Control limits are calculated from historical weekly baselines so normal seasonal variation doesn't trigger false alarms; a week only fires as anomalous when it's statistically unlikely (~3σ), not just numerically elevated. This matters especially for a scaling company: as scan volume grows from 1K to 20K per month, raw issue counts become meaningless without normalization, and a static 5% threshold set today will be miscalibrated in six months. SPC adapts — wider limits when weekly volume is low (more uncertainty), tighter limits as volume grows (more precision). The more weeks of data that accumulate, the more stable and trustworthy the baselines become. With 6–12 months of history, the charts will reliably distinguish genuine operational deterioration from normal noise, making them a durable monitoring tool rather than one that needs constant manual recalibration.
-
-**Modular architecture:** `config.py` owns all thresholds and taxonomy constants — changing an alert threshold or adding a new issue category is a one-line edit, not a code change scattered across multiple files.
-
-**Streamlit for UI:** Fastest path to a fully interactive, shareable prototype that a non-technical operator can use without any setup beyond running one command. The interface supports filtering, drill-downs, and exports without requiring any separate tooling.
-
-## How AI Was Used to Build This
-
-This tool was built end-to-end using Claude Code (Anthropic's AI coding assistant). AI was used at every stage:
-
-**Planning:** I brought my own frameworks and experience to the architectural decisions before writing a line of code — choosing statistical process control for anomaly detection, defining the alert tier logic, and designing the issue taxonomy for a preventive imaging context. Claude helped translate those decisions into a concrete implementation plan: what modules to separate, how to wire the alert engine, and how to structure the data pipeline.
-
-**Building:** Claude wrote the majority of the implementation across all modules — the CSV parser, the Claude API integration and prompt engineering, the metrics computations, the SPC p-chart logic, the alert engine, and the full Streamlit dashboard. I directed what to build and why, reviewed the output, and caught errors.
-
-**Iterating and editing:** The interface went through significant iteration — refining how charts were displayed, reordering sections, adding tooltip definitions, fixing edge cases in the alert logic, and tuning the AI classification prompt to reduce miscategorization. Claude handled each change based on my direction.
-
-**Tradeoffs:** The main tradeoff is that AI moves fast but needs careful review — generated code can be subtly wrong in ways that aren't immediately obvious. I caught several logic errors along the way (incorrect period comparisons in the KPI deltas, chart baselines computed on filtered instead of full data, gaps in how alerts were deduplicated) that required real diagnosis to fix. The upside is that the tool is significantly more complete than what I could have built solo in this timeframe — AI handled implementation, I focused on the product decisions and making sure the output was actually correct and useful.
-
----
+**How AI was used:** I brought my own frameworks to the key decisions — choosing SPC, defining alert tier logic, designing the issue taxonomy. Claude handled implementation across all modules. The interface went through significant iteration; I caught several real logic errors along the way that required diagnosis. The result is a tool far more complete than what I could have built solo in this timeframe.
 
 ## Production Roadmap
 
-**Phase 1 — Automation:** Move analysis from on-demand to scheduled (daily cron job post-survey export). Add webhook/Slack integration for Critical alerts so the on-call team is notified same-day without opening the dashboard.
+**Automate:** Schedule daily analysis post-survey export; add Slack alerts so Critical issues reach the right team same-day.  
+**Integrate:** Connect to the survey platform API directly; link member IDs to operational data (scan date, location, wait time) for richer root cause analysis.  
+**Close the loop:** Auto-create tickets routed to the right team when alerts fire; track resolution time and retest NPS to measure whether interventions worked.  
+**Refine:** Systematically spot-check AI categorization, correct where it gets it wrong, and build toward a churn prediction model once the labeled data is trustworthy.
 
-**Phase 2 — Integration:** Connect directly to the survey platform API (Medallia, Qualtrics, etc.) to eliminate manual CSV exports. Add member ID linkage to correlate NPS feedback with operational data (scan date, location, technician, wait time) for richer root cause analysis.
+## How I'd Use This to Improve the Member Experience
 
-**Phase 3 — Closed Loop:** Build a case management layer — when an alert fires, auto-create a Jira/Linear ticket routed to the right team with the AI-generated root cause hypothesis pre-populated. Track resolution time and retest NPS at the location/category level to measure whether interventions are working.
-
-**Phase 4 — AI Refinement & Predictive:** Before any of this is truly production-ready, the AI's categorization needs to be monitored and refined — regularly spot-checking tagged responses, identifying where the model gets it wrong, and tightening the prompt or adding examples to correct it. The tagging is only useful if it's trustworthy; that's an ongoing process, not a one-time setup. Once classification quality is validated, the accumulated labeled data becomes the foundation for a lightweight churn prediction model — flagging members likely to leave before they submit a detractor response and enabling proactive outreach.
-
----
-
-## How I'd Use This Daily
-
-Each morning, the Briefing tab is the first stop. The KPI strip immediately shows whether NPS, volume, and severity moved overnight vs. the prior equivalent period. If any Critical alerts are active, the red banner fires — that means a severity-5 response or a sustained high-severity category that needs same-day escalation to the relevant team owner.
-
-The practical workflow:
-- **Critical alerts → same-day Slack to team owner** with the example quotes and suggested action pre-filled from the AI output
-- **Warning alerts → weekly ops review agenda item** — the category is trending but not yet acute; the team lead reviews root cause hypotheses and assigns an investigation
-- **Location deviations → site operations call** — if Houston is running 60% above network average on Scheduling, that's a staffing or booking system problem specific to that location, not a systemic issue
-- **Promoter drivers → product/marketing input** — what promoters praise (fast results, clinical reassurance, staff quality) informs what to double down on in member communications and service design
-
-The goal is to compress the feedback-to-action loop from weeks (ad hoc survey reviews) to hours (automated daily triage with pre-routed ownership).
+The daily workflow starts on the Briefing tab. Critical alerts go to the team owner the same morning with example quotes and suggested actions already surfaced — no manual triage required. But the real value is in using the output to make deliberate UX changes, not just react to individual complaints. If Scheduling issues are spiking at a specific location, that's a prompt to audit the booking flow there — is it a capacity problem, a system bug, or a communication gap at confirmation? If Communication issues trend upward network-wide for two consecutive weeks, that's a signal to review the post-booking and post-scan touchpoint experience. Promoter feedback tells you what to protect and amplify: if members consistently cite fast results and clinical reassurance as reasons they'd recommend PreventativeScan, those become non-negotiable quality bars as the company scales. The goal is compressing the feedback-to-action loop from weeks to hours — and making sure that every operational and experience decision is grounded in what members are actually saying.
 
 ---
 
-Built using Claude Code (Anthropic). All source code, README, and this memo are included in the submission package.
+Built using Claude Code (Anthropic).
